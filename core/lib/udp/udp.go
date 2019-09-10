@@ -8,8 +8,8 @@ import (
 	"strings"
 	"time"
 
-	bufx "github.com/snail007/goproxy/core/lib/buf"
-	mapx "github.com/snail007/goproxy/core/lib/mapx"
+	bufx "github.com/litecy/goproxy/core/lib/buf"
+	mapx "github.com/litecy/goproxy/core/lib/mapx"
 )
 
 type CreateOutUDPConnFn func(listener *net.UDPConn, srcAddr *net.UDPAddr, packet []byte) (outconn *net.UDPConn, err error)

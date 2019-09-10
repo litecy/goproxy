@@ -7,9 +7,9 @@ import (
 	"runtime/debug"
 	"time"
 
-	"github.com/snail007/goproxy/utils"
-	goaes "github.com/snail007/goproxy/utils/aes"
-	"github.com/snail007/goproxy/utils/socks"
+	"github.com/litecy/goproxy/utils"
+	goaes "github.com/litecy/goproxy/utils/aes"
+	"github.com/litecy/goproxy/utils/socks"
 )
 
 func (s *SPS) RunSSUDP(addr string) (err error) {
