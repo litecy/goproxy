@@ -1,16 +1,19 @@
-package proxy
+package config
 
 import (
+	"bufio"
 	"crypto/sha1"
 	"fmt"
 	"io/ioutil"
 	logger "log"
 	"os"
+	"os/exec"
 	"path"
 	"path/filepath"
+	"runtime/debug"
 	"runtime/pprof"
 	"strings"
-	"sync"
+	"time"
 
 	"github.com/litecy/goproxy/pkg/core/lib/kcpcfg"
 	encryptconn "github.com/litecy/goproxy/pkg/core/lib/transport/encrypt"
@@ -23,51 +26,23 @@ import (
 	tcpx "github.com/litecy/goproxy/pkg/services/tcp"
 	tunnelx "github.com/litecy/goproxy/pkg/services/tunnel"
 	udpx "github.com/litecy/goproxy/pkg/services/udp"
-
+	sdk "github.com/litecy/goproxy/sdk/android-ios"
 	"github.com/xtaci/kcp-go"
+
 	"golang.org/x/crypto/pbkdf2"
 	"gopkg.in/alecthomas/kingpin.v2"
 )
 
-var SDK_VERSION = "No Version Provided"
-
 var (
-	app *kingpin.Application
+	App                                               *kingpin.Application
+	Service                                           *services.ServiceItem
+	Cmd                                               *exec.Cmd
 	cpuProfilingFile, memProfilingFile, blockProfilingFile,
 	goroutineProfilingFile, threadcreateProfilingFile *os.File
-	isProfiling   bool
-	profilingLock = &sync.Mutex{}
+	IsDebug *bool
 )
 
-type LogCallback interface {
-	Write(line string)
-}
-type logCallback interface {
-	Write(line string)
-}
-type logWriter struct {
-	callback LogCallback
-}
-
-func (s *logWriter) Write(p []byte) (n int, err error) {
-	s.callback.Write(string(p))
-	return
-}
-
-func Start(serviceID, serviceArgsStr string) (errStr string) {
-	return StartWithLog(serviceID, serviceArgsStr, nil)
-}
-
-//Start
-//serviceID : is service identify id,different service's id should be difference
-//serviceArgsStr: is the whole command line args string
-//such as :
-//1."http -t tcp -p :8989"
-//2."socks -t tcp -p :8989"
-//and so on.
-//if an error occured , errStr will be the error reason
-//if start success, errStr is empty.
-func StartWithLog(serviceID, serviceArgsStr string, loggerCallback LogCallback) (errStr string) {
+func InitConfig() (err error) {
 	//define  args
 	tcpArgs := tcpx.TCPArgs{}
 	httpArgs := httpx.HTTPArgs{}
@@ -80,35 +55,37 @@ func StartWithLog(serviceID, serviceArgsStr string, loggerCallback LogCallback) 
 	udpArgs := udpx.UDPArgs{}
 	socksArgs := socksx.SocksArgs{}
 	spsArgs := spsx.SPSArgs{}
-	dnsArgs := DNSArgs{}
+	dnsArgs := sdk.DNSArgs{}
 	keygenArgs := keygenx.KeygenArgs{}
 	kcpArgs := kcpcfg.KCPConfigArgs{}
 	//build srvice args
-	app = kingpin.New("proxy", "happy with proxy")
-	app.Author("snail").Version(SDK_VERSION)
-	debug := app.Flag("debug", "debug log output").Default("false").Bool()
-	logfile := app.Flag("log", "log file path").Default("").String()
-	nolog := app.Flag("nolog", "turn off logging").Default("false").Bool()
-	kcpArgs.Key = app.Flag("kcp-key", "pre-shared secret between client and server").Default("secrect").String()
-	kcpArgs.Crypt = app.Flag("kcp-method", "encrypt/decrypt method, can be: aes, aes-128, aes-192, salsa20, blowfish, twofish, cast5, 3des, tea, xtea, xor, sm4, none").Default("aes").Enum("aes", "aes-128", "aes-192", "salsa20", "blowfish", "twofish", "cast5", "3des", "tea", "xtea", "xor", "sm4", "none")
-	kcpArgs.Mode = app.Flag("kcp-mode", "profiles: fast3, fast2, fast, normal, manual").Default("fast3").Enum("fast3", "fast2", "fast", "normal", "manual")
-	kcpArgs.MTU = app.Flag("kcp-mtu", "set maximum transmission unit for UDP packets").Default("1350").Int()
-	kcpArgs.SndWnd = app.Flag("kcp-sndwnd", "set send window size(num of packets)").Default("1024").Int()
-	kcpArgs.RcvWnd = app.Flag("kcp-rcvwnd", "set receive window size(num of packets)").Default("1024").Int()
-	kcpArgs.DataShard = app.Flag("kcp-ds", "set reed-solomon erasure coding - datashard").Default("10").Int()
-	kcpArgs.ParityShard = app.Flag("kcp-ps", "set reed-solomon erasure coding - parityshard").Default("3").Int()
-	kcpArgs.DSCP = app.Flag("kcp-dscp", "set DSCP(6bit)").Default("0").Int()
-	kcpArgs.NoComp = app.Flag("kcp-nocomp", "disable compression").Default("false").Bool()
-	kcpArgs.AckNodelay = app.Flag("kcp-acknodelay", "be carefull! flush ack immediately when a packet is received").Default("true").Bool()
-	kcpArgs.NoDelay = app.Flag("kcp-nodelay", "be carefull!").Default("0").Int()
-	kcpArgs.Interval = app.Flag("kcp-interval", "be carefull!").Default("50").Int()
-	kcpArgs.Resend = app.Flag("kcp-resend", "be carefull!").Default("0").Int()
-	kcpArgs.NoCongestion = app.Flag("kcp-nc", "be carefull! no congestion").Default("0").Int()
-	kcpArgs.SockBuf = app.Flag("kcp-sockbuf", "be carefull!").Default("4194304").Int()
-	kcpArgs.KeepAlive = app.Flag("kcp-keepalive", "be carefull!").Default("10").Int()
+	App = kingpin.New("proxy", "happy with proxy")
+	App.Author("snail").Version(AppVersion)
+	IsDebug = App.Flag("debug", "debug log output").Default("false").Bool()
+	daemon := App.Flag("daemon", "run proxy in background").Default("false").Bool()
+	forever := App.Flag("forever", "run proxy in forever,fail and retry").Default("false").Bool()
+	logfile := App.Flag("log", "log file path").Default("").String()
+	nolog := App.Flag("nolog", "turn off logging").Default("false").Bool()
+	kcpArgs.Key = App.Flag("kcp-key", "pre-shared secret between client and server").Default("secrect").String()
+	kcpArgs.Crypt = App.Flag("kcp-method", "encrypt/decrypt method, can be: aes, aes-128, aes-192, salsa20, blowfish, twofish, cast5, 3des, tea, xtea, xor, sm4, none").Default("aes").Enum("aes", "aes-128", "aes-192", "salsa20", "blowfish", "twofish", "cast5", "3des", "tea", "xtea", "xor", "sm4", "none")
+	kcpArgs.Mode = App.Flag("kcp-mode", "profiles: fast3, fast2, fast, normal, manual").Default("fast").Enum("fast3", "fast2", "fast", "normal", "manual")
+	kcpArgs.MTU = App.Flag("kcp-mtu", "set maximum transmission unit for UDP packets").Default("450").Int()
+	kcpArgs.SndWnd = App.Flag("kcp-sndwnd", "set send window size(num of packets)").Default("1024").Int()
+	kcpArgs.RcvWnd = App.Flag("kcp-rcvwnd", "set receive window size(num of packets)").Default("1024").Int()
+	kcpArgs.DataShard = App.Flag("kcp-ds", "set reed-solomon erasure coding - datashard").Default("10").Int()
+	kcpArgs.ParityShard = App.Flag("kcp-ps", "set reed-solomon erasure coding - parityshard").Default("3").Int()
+	kcpArgs.DSCP = App.Flag("kcp-dscp", "set DSCP(6bit)").Default("0").Int()
+	kcpArgs.NoComp = App.Flag("kcp-nocomp", "disable compression").Default("false").Bool()
+	kcpArgs.AckNodelay = App.Flag("kcp-acknodelay", "be carefull! flush ack immediately when a packet is received").Default("true").Bool()
+	kcpArgs.NoDelay = App.Flag("kcp-nodelay", "be carefull!").Default("0").Int()
+	kcpArgs.Interval = App.Flag("kcp-interval", "be carefull!").Default("50").Int()
+	kcpArgs.Resend = App.Flag("kcp-resend", "be carefull!").Default("0").Int()
+	kcpArgs.NoCongestion = App.Flag("kcp-nc", "be carefull! no congestion").Default("0").Int()
+	kcpArgs.SockBuf = App.Flag("kcp-sockbuf", "be carefull!").Default("4194304").Int()
+	kcpArgs.KeepAlive = App.Flag("kcp-keepalive", "be carefull!").Default("10").Int()
 
 	//########http#########
-	http := app.Command("http", "proxy on http mode")
+	http := App.Command("http", "proxy on http mode")
 	httpArgs.Parent = http.Flag("parent", "parent address, such as: \"23.32.32.19:28008\"").Default("").Short('P').Strings()
 	httpArgs.CaCertFile = http.Flag("ca", "ca cert file for tls").Default("").String()
 	httpArgs.CertFile = http.Flag("cert", "cert file for tls").Short('C').Default("proxy.crt").String()
@@ -149,9 +126,9 @@ func StartWithLog(serviceID, serviceArgsStr string, loggerCallback LogCallback) 
 	httpArgs.RateLimit = http.Flag("rate-limit", "rate limit (bytes/second) of each connection, such as: 100K 1.5M . 0 means no limitation").Short('l').Default("0").String()
 	httpArgs.BindListen = http.Flag("bind-listen", "using listener binding IP when connect to target").Short('B').Default("false").Bool()
 	httpArgs.Jumper = http.Flag("jumper", "https or socks5 proxies used when connecting to parent, only worked of -T is tls or tcp, format is https://username:password@host:port https://host:port or socks5://username:password@host:port socks5://host:port").Short('J').Default("").String()
-	httpArgs.Debug = debug
+	httpArgs.Debug = IsDebug
 	//########tcp#########
-	tcp := app.Command("tcp", "proxy on tcp mode")
+	tcp := App.Command("tcp", "proxy on tcp mode")
 	tcpArgs.Parent = tcp.Flag("parent", "parent address, such as: \"23.32.32.19:28008\"").Default("").Short('P').String()
 	tcpArgs.CertFile = tcp.Flag("cert", "cert file for tls").Short('C').Default("proxy.crt").String()
 	tcpArgs.KeyFile = tcp.Flag("key", "key file for tls").Short('K').Default("proxy.key").String()
@@ -163,7 +140,7 @@ func StartWithLog(serviceID, serviceArgsStr string, loggerCallback LogCallback) 
 	tcpArgs.Jumper = tcp.Flag("jumper", "https or socks5 proxies used when connecting to parent, only worked of -T is tls or tcp, format is https://username:password@host:port https://host:port or socks5://username:password@host:port socks5://host:port").Short('J').Default("").String()
 
 	//########udp#########
-	udp := app.Command("udp", "proxy on udp mode")
+	udp := App.Command("udp", "proxy on udp mode")
 	udpArgs.Parent = udp.Flag("parent", "parent address, such as: \"23.32.32.19:28008\"").Default("").Short('P').String()
 	udpArgs.CertFile = udp.Flag("cert", "cert file for tls").Short('C').Default("proxy.crt").String()
 	udpArgs.KeyFile = udp.Flag("key", "key file for tls").Short('K').Default("proxy.key").String()
@@ -173,7 +150,7 @@ func StartWithLog(serviceID, serviceArgsStr string, loggerCallback LogCallback) 
 	udpArgs.Local = udp.Flag("local", "local ip:port to listen").Short('p').Default(":33080").String()
 
 	//########mux-server#########
-	muxServer := app.Command("server", "proxy on mux server mode")
+	muxServer := App.Command("server", "proxy on mux server mode")
 	muxServerArgs.Parent = muxServer.Flag("parent", "parent address, such as: \"23.32.32.19:28008\"").Default("").Short('P').String()
 	muxServerArgs.ParentType = muxServer.Flag("parent-type", "parent protocol type <tls|tcp|tcps|kcp|tou>").Default("tls").Short('T').Enum("tls", "tcp", "tcps", "kcp", "tou")
 	muxServerArgs.CertFile = muxServer.Flag("cert", "cert file for tls").Short('C').Default("proxy.crt").String()
@@ -191,7 +168,7 @@ func StartWithLog(serviceID, serviceArgsStr string, loggerCallback LogCallback) 
 	muxServerArgs.TOUPassword = muxServer.Flag("tou-password", "password of parent tou's encrpyt/decrypt").Default("snail007's_goproxy").String()
 
 	//########mux-client#########
-	muxClient := app.Command("client", "proxy on mux client mode")
+	muxClient := App.Command("client", "proxy on mux client mode")
 	muxClientArgs.Parent = muxClient.Flag("parent", "parent address, such as: \"23.32.32.19:28008\"").Default("").Short('P').String()
 	muxClientArgs.ParentType = muxClient.Flag("parent-type", "parent protocol type <tls|tcp|tcps|kcp|tou>").Default("tls").Short('T').Enum("tls", "tcp", "tcps", "kcp", "tou")
 	muxClientArgs.CertFile = muxClient.Flag("cert", "cert file for tls").Short('C').Default("proxy.crt").String()
@@ -207,7 +184,7 @@ func StartWithLog(serviceID, serviceArgsStr string, loggerCallback LogCallback) 
 	muxClientArgs.TOUPassword = muxClient.Flag("tou-password", "password of parent tou's encrpyt/decrypt").Default("snail007's_goproxy").String()
 
 	//########mux-bridge#########
-	muxBridge := app.Command("bridge", "proxy on mux bridge mode")
+	muxBridge := App.Command("bridge", "proxy on mux bridge mode")
 	muxBridgeArgs.CertFile = muxBridge.Flag("cert", "cert file for tls").Short('C').Default("proxy.crt").String()
 	muxBridgeArgs.KeyFile = muxBridge.Flag("key", "key file for tls").Short('K').Default("proxy.key").String()
 	muxBridgeArgs.Timeout = muxBridge.Flag("timeout", "tcp timeout with milliseconds").Short('i').Default("2000").Int()
@@ -219,7 +196,7 @@ func StartWithLog(serviceID, serviceArgsStr string, loggerCallback LogCallback) 
 	muxBridgeArgs.TOUPassword = muxBridge.Flag("tou-password", "password of local tou's encrpyt/decrypt").Default("snail007's_goproxy").String()
 
 	//########tunnel-server#########
-	tunnelServer := app.Command("tserver", "proxy on tunnel server mode")
+	tunnelServer := App.Command("tserver", "proxy on tunnel server mode")
 	tunnelServerArgs.Parent = tunnelServer.Flag("parent", "parent address, such as: \"23.32.32.19:28008\"").Default("").Short('P').String()
 	tunnelServerArgs.CertFile = tunnelServer.Flag("cert", "cert file for tls").Short('C').Default("proxy.crt").String()
 	tunnelServerArgs.KeyFile = tunnelServer.Flag("key", "key file for tls").Short('K').Default("proxy.key").String()
@@ -230,7 +207,7 @@ func StartWithLog(serviceID, serviceArgsStr string, loggerCallback LogCallback) 
 	tunnelServerArgs.Jumper = tunnelServer.Flag("jumper", "https or socks5 proxies used when connecting to parent, only worked of -T is tls or tcp, format is https://username:password@host:port https://host:port or socks5://username:password@host:port socks5://host:port").Short('J').Default("").String()
 
 	//########tunnel-client#########
-	tunnelClient := app.Command("tclient", "proxy on tunnel client mode")
+	tunnelClient := App.Command("tclient", "proxy on tunnel client mode")
 	tunnelClientArgs.Parent = tunnelClient.Flag("parent", "parent address, such as: \"23.32.32.19:28008\"").Default("").Short('P').String()
 	tunnelClientArgs.CertFile = tunnelClient.Flag("cert", "cert file for tls").Short('C').Default("proxy.crt").String()
 	tunnelClientArgs.KeyFile = tunnelClient.Flag("key", "key file for tls").Short('K').Default("proxy.key").String()
@@ -239,14 +216,14 @@ func StartWithLog(serviceID, serviceArgsStr string, loggerCallback LogCallback) 
 	tunnelClientArgs.Jumper = tunnelClient.Flag("jumper", "https or socks5 proxies used when connecting to parent, only worked of -T is tls or tcp, format is https://username:password@host:port https://host:port or socks5://username:password@host:port socks5://host:port").Short('J').Default("").String()
 
 	//########tunnel-bridge#########
-	tunnelBridge := app.Command("tbridge", "proxy on tunnel bridge mode")
+	tunnelBridge := App.Command("tbridge", "proxy on tunnel bridge mode")
 	tunnelBridgeArgs.CertFile = tunnelBridge.Flag("cert", "cert file for tls").Short('C').Default("proxy.crt").String()
 	tunnelBridgeArgs.KeyFile = tunnelBridge.Flag("key", "key file for tls").Short('K').Default("proxy.key").String()
 	tunnelBridgeArgs.Timeout = tunnelBridge.Flag("timeout", "tcp timeout with milliseconds").Short('t').Default("2000").Int()
 	tunnelBridgeArgs.Local = tunnelBridge.Flag("local", "local ip:port to listen").Short('p').Default(":33080").String()
 
-	//########ssh#########
-	socks := app.Command("socks", "proxy on ssh mode")
+	//########socks#########
+	socks := App.Command("socks", "proxy on ssh mode")
 	socksArgs.Parent = socks.Flag("parent", "parent ssh address, such as: \"23.32.32.19:22\"").Default("").Short('P').Strings()
 	socksArgs.ParentType = socks.Flag("parent-type", "parent protocol type <tls|tcp|kcp|ssh>").Default("tcp").Short('T').Enum("tls", "tcp", "kcp", "ssh")
 	socksArgs.LocalType = socks.Flag("local-type", "local protocol type <tls|tcp|kcp>").Default("tcp").Short('t').Enum("tls", "tcp", "kcp")
@@ -285,10 +262,10 @@ func StartWithLog(serviceID, serviceArgsStr string, loggerCallback LogCallback) 
 	socksArgs.LoadBalanceOnlyHA = socks.Flag("lb-onlyha", "use only `high availability mode` to choose parent for LB").Default("false").Bool()
 	socksArgs.RateLimit = socks.Flag("rate-limit", "rate limit (bytes/second) of each connection, such as: 100K 1.5M . 0 means no limitation").Short('l').Default("0").String()
 	socksArgs.BindListen = socks.Flag("bind-listen", "using listener binding IP when connect to target").Short('B').Default("false").Bool()
-	socksArgs.Debug = debug
+	socksArgs.Debug = IsDebug
 
-	//########socks+http(s)#########
-	sps := app.Command("sps", "proxy on socks+http(s) mode")
+	//########sps#########
+	sps := App.Command("sps", "proxy on socks+http(s) mode")
 	spsArgs.Parent = sps.Flag("parent", "parent address, such as: \"23.32.32.19:28008\"").Default("").Short('P').Strings()
 	spsArgs.CertFile = sps.Flag("cert", "cert file for tls").Short('C').Default("proxy.crt").String()
 	spsArgs.KeyFile = sps.Flag("key", "key file for tls").Short('K').Default("proxy.key").String()
@@ -297,7 +274,7 @@ func StartWithLog(serviceID, serviceArgsStr string, loggerCallback LogCallback) 
 	spsArgs.ParentType = sps.Flag("parent-type", "parent protocol type <tls|tcp|kcp>").Short('T').Enum("tls", "tcp", "kcp")
 	spsArgs.LocalType = sps.Flag("local-type", "local protocol type <tls|tcp|kcp>").Default("tcp").Short('t').Enum("tls", "tcp", "kcp")
 	spsArgs.Local = sps.Flag("local", "local ip:port to listen,multiple address use comma split,such as: 0.0.0.0:80,0.0.0.0:443").Short('p').Default(":33080").String()
-	spsArgs.ParentServiceType = sps.Flag("parent-service-type", "parent service type <http|socks|ss>").Short('S').Enum("http", "socks", "ss")
+	spsArgs.ParentServiceType = sps.Flag("parent-Service-type", "parent Service type <http|socks|ss>").Short('S').Enum("http", "socks", "ss")
 	spsArgs.DNSAddress = sps.Flag("dns-address", "if set this, proxy will use this dns for resolve doamin").Short('q').Default("").String()
 	spsArgs.DNSTTL = sps.Flag("dns-ttl", "caching seconds of dns query result").Short('e').Default("300").Int()
 	spsArgs.AuthFile = sps.Flag("auth-file", "http basic auth file,\"username:password\" each line in file").Short('F').String()
@@ -319,7 +296,7 @@ func StartWithLog(serviceID, serviceArgsStr string, loggerCallback LogCallback) 
 	spsArgs.DisableHTTP = sps.Flag("disable-http", "disable http(s) proxy").Default("false").Bool()
 	spsArgs.DisableSocks5 = sps.Flag("disable-socks", "disable socks proxy").Default("false").Bool()
 	spsArgs.DisableSS = sps.Flag("disable-ss", "disable ss proxy").Default("false").Bool()
-	spsArgs.LoadBalanceMethod = sps.Flag("lb-method", "load balance method when use multiple parent,can be <roundrobin|leastconn|leasttime|hash|weight>").Default("hash").Enum("roundrobin", "weight", "leastconn", "leasttime", "hash")
+	spsArgs.LoadBalanceMethod = sps.Flag("lb-method", "load balance method when use multiple parent,can be <roundrobin|leastconn|leasttime|hash|weight>").Default("roundrobin").Enum("roundrobin", "weight", "leastconn", "leasttime", "hash")
 	spsArgs.LoadBalanceTimeout = sps.Flag("lb-timeout", "tcp milliseconds timeout of connecting to parent").Default("500").Int()
 	spsArgs.LoadBalanceRetryTime = sps.Flag("lb-retrytime", "sleep time milliseconds after checking").Default("1000").Int()
 	spsArgs.LoadBalanceHashTarget = sps.Flag("lb-hashtarget", "use target address to choose parent for LB").Default("false").Bool()
@@ -327,10 +304,10 @@ func StartWithLog(serviceID, serviceArgsStr string, loggerCallback LogCallback) 
 	spsArgs.RateLimit = sps.Flag("rate-limit", "rate limit (bytes/second) of each connection, such as: 100K 1.5M . 0 means no limitation").Short('l').Default("0").String()
 	spsArgs.Jumper = sps.Flag("jumper", "https or socks5 proxies used when connecting to parent, only worked of -T is tls or tcp, format is https://username:password@host:port https://host:port or socks5://username:password@host:port socks5://host:port").Default("").String()
 	spsArgs.ParentTLSSingle = sps.Flag("parent-tls-single", "conntect to parent insecure skip verify").Default("false").Bool()
-	spsArgs.Debug = debug
+	spsArgs.Debug = IsDebug
 
 	//########dns#########
-	dns := app.Command("dns", "proxy on dns server mode")
+	dns := App.Command("dns", "proxy on dns server mode")
 	dnsArgs.Parent = dns.Flag("parent", "parent address, such as: \"23.32.32.19:28008\"").Default("").Short('P').String()
 	dnsArgs.CertFile = dns.Flag("cert", "cert file for tls").Short('C').Default("proxy.crt").String()
 	dnsArgs.KeyFile = dns.Flag("key", "key file for tls").Short('K').Default("proxy.key").String()
@@ -338,7 +315,7 @@ func StartWithLog(serviceID, serviceArgsStr string, loggerCallback LogCallback) 
 	dnsArgs.Timeout = dns.Flag("timeout", "tcp timeout milliseconds when connect to real server or parent proxy").Short('i').Default("2000").Int()
 	dnsArgs.ParentType = dns.Flag("parent-type", "parent protocol type <tls|tcp|kcp>").Short('T').Enum("tls", "tcp", "kcp")
 	dnsArgs.Local = dns.Flag("local", "local ip:port to listen,multiple address use comma split,such as: 0.0.0.0:80,0.0.0.0:443").Short('p').Default(":53").String()
-	dnsArgs.ParentServiceType = dns.Flag("parent-service-type", "parent service type <http|socks>").Short('S').Enum("http", "socks")
+	dnsArgs.ParentServiceType = dns.Flag("parent-Service-type", "parent Service type <http|socks>").Short('S').Enum("http", "socks")
 	dnsArgs.RemoteDNSAddress = dns.Flag("dns-address", "remote dns for resolve doamin").Short('q').Default("8.8.8.8:53").String()
 	dnsArgs.DNSTTL = dns.Flag("dns-ttl", "caching seconds of dns query result").Short('e').Default("300").Int()
 	dnsArgs.ParentAuth = dns.Flag("parent-auth", "parent socks auth username and password, such as: -A user1:pass1").Short('A').String()
@@ -348,7 +325,7 @@ func StartWithLog(serviceID, serviceArgsStr string, loggerCallback LogCallback) 
 	dnsArgs.LocalSocks5Port = dns.Flag("socks-port", "local socks5 port").Short('s').Default("65501").String()
 
 	//########keygen#########
-	keygen := app.Command("keygen", "create certificate for proxy")
+	keygen := App.Command("keygen", "create certificate for proxy")
 	keygenArgs.CommonName = keygen.Flag("cn", "common name").Short('n').Default("").String()
 	keygenArgs.CaName = keygen.Flag("ca", "ca name").Short('C').Default("").String()
 	keygenArgs.CertName = keygen.Flag("cert", "cert name of sign to create").Short('c').Default("").String()
@@ -356,15 +333,8 @@ func StartWithLog(serviceID, serviceArgsStr string, loggerCallback LogCallback) 
 	keygenArgs.Sign = keygen.Flag("sign", "cert is to signin").Short('s').Default("false").Bool()
 
 	//parse args
-	_args := strings.Fields(strings.Trim(serviceArgsStr, " "))
-	args := []string{}
-	for _, a := range _args {
-		args = append(args, strings.Trim(a, "\""))
-	}
-	serviceName, err := app.Parse(args)
-	if err != nil {
-		return fmt.Sprintf("parse args fail,err: %s", err)
-	}
+	serviceName := kingpin.MustParse(App.Parse(os.Args[1:]))
+
 	//set kcp config
 
 	switch *kcpArgs.Mode {
@@ -418,107 +388,170 @@ func StartWithLog(serviceID, serviceArgsStr string, loggerCallback LogCallback) 
 	muxClientArgs.KCP = kcpArgs
 	dnsArgs.KCP = kcpArgs
 
-	log := logger.New(os.Stdout, "", logger.Ldate|logger.Ltime)
+	log := logger.New(os.Stderr, "", logger.Ldate|logger.Ltime)
+
 	flags := logger.Ldate
-	if *debug {
+	if *IsDebug {
 		flags |= logger.Lshortfile | logger.Lmicroseconds
+		cpuProfilingFile, _ = os.Create("cpu.prof")
+		memProfilingFile, _ = os.Create("memory.prof")
+		blockProfilingFile, _ = os.Create("block.prof")
+		goroutineProfilingFile, _ = os.Create("goroutine.prof")
+		threadcreateProfilingFile, _ = os.Create("threadcreate.prof")
+		pprof.StartCPUProfile(cpuProfilingFile)
 	} else {
 		flags |= logger.Ltime
 	}
 	log.SetFlags(flags)
-
-	if loggerCallback == nil {
-		if *nolog {
-			log.SetOutput(ioutil.Discard)
-		} else if *logfile != "" {
-			f, e := os.OpenFile(*logfile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
-			if e != nil {
-				log.Fatal(e)
-			}
-			log.SetOutput(f)
+	if *nolog {
+		log.SetOutput(ioutil.Discard)
+	} else if *logfile != "" {
+		f, e := os.OpenFile(*logfile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
+		if e != nil {
+			log.Fatal(e)
 		}
-	} else {
-		log.SetOutput(&logWriter{
-			callback: loggerCallback,
-		})
+		log.SetOutput(f)
+	}
+	if *daemon {
+		args := []string{}
+		for _, arg := range os.Args[1:] {
+			if arg != "--daemon" {
+				args = append(args, arg)
+			}
+		}
+		Cmd = exec.Command(os.Args[0], args...)
+		Cmd.Start()
+		f := ""
+		if *forever {
+			f = "forever "
+		}
+		log.Printf("%s%s [PID] %d running...\n", f, os.Args[0], Cmd.Process.Pid)
+		os.Exit(0)
+	}
+	if *forever {
+		args := []string{}
+		for _, arg := range os.Args[1:] {
+			if arg != "--forever" {
+				args = append(args, arg)
+			}
+		}
+		go func() {
+			defer func() {
+				if e := recover(); e != nil {
+					fmt.Printf("crashed, err: %s\nstack:%s", e, string(debug.Stack()))
+				}
+			}()
+			for {
+				if Cmd != nil {
+					Cmd.Process.Kill()
+					time.Sleep(time.Second * 5)
+				}
+				Cmd = exec.Command(os.Args[0], args...)
+				cmdReaderStderr, err := Cmd.StderrPipe()
+				if err != nil {
+					log.Printf("ERR:%s,restarting...\n", err)
+					continue
+				}
+				cmdReader, err := Cmd.StdoutPipe()
+				if err != nil {
+					log.Printf("ERR:%s,restarting...\n", err)
+					continue
+				}
+				scanner := bufio.NewScanner(cmdReader)
+				scannerStdErr := bufio.NewScanner(cmdReaderStderr)
+				go func() {
+					defer func() {
+						if e := recover(); e != nil {
+							fmt.Printf("crashed, err: %s\nstack:%s", e, string(debug.Stack()))
+						}
+					}()
+					for scanner.Scan() {
+						fmt.Println(scanner.Text())
+					}
+				}()
+				go func() {
+					defer func() {
+						if e := recover(); e != nil {
+							fmt.Printf("crashed, err: %s\nstack:%s", e, string(debug.Stack()))
+						}
+					}()
+					for scannerStdErr.Scan() {
+						fmt.Println(scannerStdErr.Text())
+					}
+				}()
+				if err := Cmd.Start(); err != nil {
+					log.Printf("ERR:%s,restarting...\n", err)
+					continue
+				}
+				pid := Cmd.Process.Pid
+				log.Printf("worker %s [PID] %d running...\n", os.Args[0], pid)
+				if err := Cmd.Wait(); err != nil {
+					log.Printf("ERR:%s,restarting...", err)
+					continue
+				}
+				log.Printf("worker %s [PID] %d unexpected exited, restarting...\n", os.Args[0], pid)
+			}
+		}()
+		return
+	}
+	if *logfile == "" {
+		poster()
+		if *IsDebug {
+			log.Println("[profiling] cpu profiling save to file : cpu.prof")
+			log.Println("[profiling] memory profiling save to file : memory.prof")
+			log.Println("[profiling] block profiling save to file : block.prof")
+			log.Println("[profiling] goroutine profiling save to file : goroutine.prof")
+			log.Println("[profiling] threadcreate profiling save to file : threadcreate.prof")
+		}
 	}
 
-	//regist services and run service
+	//regist services and run Service
 	switch serviceName {
 	case "http":
-		services.Regist(serviceID, httpx.NewHTTP(), httpArgs, log)
+		services.Regist(serviceName, httpx.NewHTTP(), httpArgs, log)
 	case "tcp":
-		services.Regist(serviceID, tcpx.NewTCP(), tcpArgs, log)
+		services.Regist(serviceName, tcpx.NewTCP(), tcpArgs, log)
 	case "udp":
-		services.Regist(serviceID, udpx.NewUDP(), udpArgs, log)
+		services.Regist(serviceName, udpx.NewUDP(), udpArgs, log)
 	case "tserver":
-		services.Regist(serviceID, tunnelx.NewTunnelServerManager(), tunnelServerArgs, log)
+		services.Regist(serviceName, tunnelx.NewTunnelServerManager(), tunnelServerArgs, log)
 	case "tclient":
-		services.Regist(serviceID, tunnelx.NewTunnelClient(), tunnelClientArgs, log)
+		services.Regist(serviceName, tunnelx.NewTunnelClient(), tunnelClientArgs, log)
 	case "tbridge":
-		services.Regist(serviceID, tunnelx.NewTunnelBridge(), tunnelBridgeArgs, log)
+		services.Regist(serviceName, tunnelx.NewTunnelBridge(), tunnelBridgeArgs, log)
 	case "server":
-		services.Regist(serviceID, mux.NewMuxServerManager(), muxServerArgs, log)
+		services.Regist(serviceName, mux.NewMuxServerManager(), muxServerArgs, log)
 	case "client":
-		services.Regist(serviceID, mux.NewMuxClient(), muxClientArgs, log)
+		services.Regist(serviceName, mux.NewMuxClient(), muxClientArgs, log)
 	case "bridge":
-		services.Regist(serviceID, mux.NewMuxBridge(), muxBridgeArgs, log)
+		services.Regist(serviceName, mux.NewMuxBridge(), muxBridgeArgs, log)
 	case "socks":
-		services.Regist(serviceID, socksx.NewSocks(), socksArgs, log)
+		services.Regist(serviceName, socksx.NewSocks(), socksArgs, log)
 	case "sps":
-		services.Regist(serviceID, spsx.NewSPS(), spsArgs, log)
+		services.Regist(serviceName, spsx.NewSPS(), spsArgs, log)
 	case "dns":
-		services.Regist(serviceID, NewDNS(), dnsArgs, log)
+		services.Regist(serviceName, sdk.NewDNS(), dnsArgs, log)
+	case "keygen":
+		services.Regist(serviceName, keygenx.NewKeygen(), keygenArgs, log)
 	}
-	_, err = services.Run(serviceID, nil)
+	Service, err = services.Run(serviceName, nil)
 	if err != nil {
-		return fmt.Sprintf("run service [%s:%s] fail, ERR:%s", serviceID, serviceName, err)
+		log.Fatalf("run Service [%s] fail, ERR:%s", serviceName, err)
 	}
 	return
 }
 
-func Stop(serviceID string) {
-	services.Stop(serviceID)
+func poster() {
+	fmt.Printf(`Proxy Enterprise Version v%s`+" by snail , blog : http://www.host900.com/\n\n", AppVersion)
 }
-
-func Version() string {
-	return SDK_VERSION
-}
-func StartProfiling(storePath string) {
-	profilingLock.Lock()
-	defer profilingLock.Unlock()
-	if !isProfiling {
-		isProfiling = true
-		if storePath == "" {
-			storePath = "."
-		}
-		cpuProfilingFile, _ = os.Create(filepath.Join(storePath, "cpu.prof"))
-		memProfilingFile, _ = os.Create(filepath.Join(storePath, "memory.prof"))
-		blockProfilingFile, _ = os.Create(filepath.Join(storePath, "block.prof"))
-		goroutineProfilingFile, _ = os.Create(filepath.Join(storePath, "goroutine.prof"))
-		threadcreateProfilingFile, _ = os.Create(filepath.Join(storePath, "threadcreate.prof"))
-		pprof.StartCPUProfile(cpuProfilingFile)
-	}
-}
-func StopProfiling() {
-	profilingLock.Lock()
-	defer profilingLock.Unlock()
-	if isProfiling {
-		isProfiling = false
-		pprof.StopCPUProfile()
-		goroutine := pprof.Lookup("goroutine")
-		goroutine.WriteTo(goroutineProfilingFile, 1)
-		heap := pprof.Lookup("heap")
-		heap.WriteTo(memProfilingFile, 1)
-		block := pprof.Lookup("block")
-		block.WriteTo(blockProfilingFile, 1)
-		threadcreate := pprof.Lookup("threadcreate")
-		threadcreate.WriteTo(threadcreateProfilingFile, 1)
-		//close
-		goroutineProfilingFile.Close()
-		memProfilingFile.Close()
-		blockProfilingFile.Close()
-		threadcreateProfilingFile.Close()
-	}
-
+func SaveProfiling() {
+	goroutine := pprof.Lookup("goroutine")
+	goroutine.WriteTo(goroutineProfilingFile, 1)
+	heap := pprof.Lookup("heap")
+	heap.WriteTo(memProfilingFile, 1)
+	block := pprof.Lookup("block")
+	block.WriteTo(blockProfilingFile, 1)
+	threadcreate := pprof.Lookup("threadcreate")
+	threadcreate.WriteTo(threadcreateProfilingFile, 1)
+	pprof.StopCPUProfile()
 }

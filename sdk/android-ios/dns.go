@@ -11,10 +11,10 @@ import (
 
 	"golang.org/x/net/proxy"
 
+	"github.com/litecy/goproxy/pkg/core/lib/kcpcfg"
+	"github.com/litecy/goproxy/pkg/services"
 	"github.com/miekg/dns"
 	gocache "github.com/pmylund/go-cache"
-	"github.com/litecy/goproxy/core/lib/kcpcfg"
-	services "github.com/litecy/goproxy/services"
 )
 
 type DNSArgs struct {
